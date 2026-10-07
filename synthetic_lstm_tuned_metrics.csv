@@ -1,0 +1,6 @@
+train_acc, 0.8619791666666666
+train_auc, nan
+val_acc, 0.921875
+val_auc, 0.9297619047619048
+test_acc, 0.796875
+test_auc, 0.8108258928571428

@@ -1,0 +1,241 @@
+import os
+import pickle
+import numpy as np
+import scipy.special
+
+def load_hmm_or_params(path):
+    with open(path, "rb") as f:
+        obj = pickle.load(f)
+
+    # wrapper dict from notebook
+    if isinstance(obj, dict) and "true_hmm" in obj:
+        obj = obj["true_hmm"]
+
+    print("Loaded inner type:", type(obj))
+    if isinstance(obj, dict):
+        print("Inner dict keys:", sorted(obj.keys()))
+
+    return obj
+
+def _sigmoid(x):
+    return 1.0 / (1.0 + np.exp(-x))
+
+
+def _sample_categorical(rng, p):
+    return rng.choice(len(p), p=p)
+
+
+def _inputdriven_transition_matrix(true_hmm, inp):
+    """
+    Build transition matrix from current ssm.HMM parameters.
+
+    Assumes:
+      - true_hmm.transitions.log_Ps: (K, K)
+      - true_hmm.transitions.Ws:     (K, M)
+      - inp:                         (M,)
+
+    Uses destination-state logit shift:
+      logits = log_Ps + (Ws @ inp)[None, :]
+    then row-softmax.
+    """
+    log_Ps = np.asarray(true_hmm.transitions.log_Ps)
+    Ws = np.asarray(true_hmm.transitions.Ws)
+    drive = Ws @ np.asarray(inp)
+    logits = log_Ps + drive[None, :]
+    return scipy.special.softmax(logits, axis=1)
+
+
+def sample_dataset_from_hmm(
+    true_hmm,
+    N=256,
+    T=50,
+    seed=0,
+    confounded=True,
+    conf_rho=0.8,
+    conf_prev_treatment_coeff=0.6,
+    conf_static_coeff=0.8,
+    conf_noise_scale=0.2,
+    treatment_prob_unconfounded=0.5,
+    treatment_intercept=-0.2,
+    treatment_confounder_coeff=1.5,
+    treatment_state_coeff=0.7,
+):
+    """
+    Generate a dataset using the same true_hmm parameters, with either:
+      - confounded treatment assignment
+      - non-confounded treatment assignment
+
+    Input convention:
+      channel 0 = treatment
+      channel 1 = confounder
+
+    Returns dict with obs, inputs, states, labels, diagnostics.
+    """
+    rng = np.random.default_rng(seed)
+
+    K = true_hmm.transitions.log_Ps.shape[0]
+    D = true_hmm.observations.As.shape[1]
+
+    pi0 = scipy.special.softmax(np.asarray(true_hmm.init_state_distn.log_pi0))
+
+    z_static = rng.normal(size=N)
+    conf = np.zeros((N, T))
+    treat = np.zeros((N, T))
+    states = np.zeros((N, T), dtype=int)
+    obs = np.zeros((N, T, D))
+
+    P0 = np.zeros((N, T, K, K))
+    P1 = np.zeros((N, T, K, K))
+    delta_transition = np.zeros((N, T, K, K))
+
+    for n in range(N):
+        prev_w = 0.0
+
+        for t in range(T):
+            noise_u = rng.normal(scale=conf_noise_scale)
+            if t == 0:
+                conf[n, t] = conf_static_coeff * z_static[n] + noise_u
+            else:
+                conf[n, t] = (
+                    conf_rho * conf[n, t - 1]
+                    + conf_prev_treatment_coeff * prev_w
+                    + conf_static_coeff * z_static[n]
+                    + noise_u
+                )
+
+            if confounded:
+                treat_logit = treatment_intercept + treatment_confounder_coeff * conf[n, t]
+                if t > 0:
+                    # same style you used before; feel free to replace with a K-state coefficient vector
+                    treat_logit += treatment_state_coeff * (2 * states[n, t - 1] - 1)
+                treat_prob = _sigmoid(treat_logit)
+                treat[n, t] = rng.binomial(1, treat_prob)
+            else:
+                # no confounding: treatment independent of confounder and previous state
+                treat[n, t] = rng.binomial(1, treatment_prob_unconfounded)
+
+            inp = np.array([treat[n, t], conf[n, t]], dtype=float)
+
+            # treatment-specific transition matrices at current confounder
+            P0[n, t] = _inputdriven_transition_matrix(true_hmm, np.array([0.0, conf[n, t]]))
+            P1[n, t] = _inputdriven_transition_matrix(true_hmm, np.array([1.0, conf[n, t]]))
+            delta_transition[n, t] = P1[n, t] - P0[n, t]
+
+            if t == 0:
+                states[n, t] = _sample_categorical(rng, pi0)
+                xhist = np.zeros((1, D))
+            else:
+                trans = _inputdriven_transition_matrix(true_hmm, inp)
+                states[n, t] = _sample_categorical(rng, trans[states[n, t - 1]])
+                xhist = obs[n, t - 1 : t]
+
+            obs[n, t] = true_hmm.observations.sample_x(
+                states[n, t],
+                xhist,
+                input=inp,
+                tag=None,
+            )
+
+            prev_w = treat[n, t]
+
+    # labels are not central in your runner; zeros are fine unless you want something else
+    labels = np.zeros(N, dtype=int)
+
+    return {
+        "obs": obs,
+        "inputs": np.stack([treat, conf], axis=-1),
+        "states": states,
+        "labels": labels,
+        "conf": conf,
+        "treat": treat,
+        "z_static": z_static,
+        "P0": P0,
+        "P1": P1,
+        "delta_transition": delta_transition,
+    }
+
+
+def export_bundle(out_path, sim, true_hmm):
+    K = true_hmm.transitions.log_Ps.shape[0]
+    D = sim["obs"].shape[-1]
+    M = sim["inputs"].shape[-1]
+    T = sim["obs"].shape[1]
+
+    Ps_true = scipy.special.softmax(np.asarray(true_hmm.transitions.log_Ps), axis=1)
+    Ws_true = np.asarray(true_hmm.transitions.Ws)
+
+    As_true = np.asarray(true_hmm.observations.As)
+    bs_true = np.asarray(true_hmm.observations.bs)
+
+    if hasattr(true_hmm.observations, "Vs"):
+        Vs_true = np.asarray(true_hmm.observations.Vs)
+    else:
+        Vs_true = np.zeros((K, D, M))
+
+    if hasattr(true_hmm.observations, "mu_init"):
+        mu_init_true = np.asarray(true_hmm.observations.mu_init)
+    elif hasattr(true_hmm.observations, "mus"):
+        mu_init_true = np.asarray(true_hmm.observations.mus)
+    else:
+        mu_init_true = np.zeros((K, D))
+
+    np.savez(
+        out_path,
+        obs=sim["obs"],
+        inputs=sim["inputs"],
+        states=sim["states"],
+        labels=sim["labels"],
+        Ps_true=Ps_true,
+        Ws_true=Ws_true,
+        As_true=As_true,
+        bs_true=bs_true,
+        Vs_true=Vs_true,
+        mu_init_true=mu_init_true,
+        K_true=np.array(K),
+        D=np.array(D),
+        M=np.array(M),
+        T=np.array(T),
+    )
+
+
+def summarize_sim(name, sim):
+    print(f"\n{name}")
+    print("  treatment rate:", float(sim["treat"].mean()))
+    print("  obs mean first 3 dims:", sim["obs"].mean(axis=(0, 1))[:3])
+    print("  state occupancy:", np.bincount(sim["states"].reshape(-1), minlength=sim["P0"].shape[-1]))
+    print("  avg delta_transition:\n", sim["delta_transition"].mean(axis=(0, 1)))
+
+
+def main():
+    # change this to your notebook/repo true_hmm pickle path if needed
+    true_hmm_path = "/home/ubuntu/vyu/constrained-ssm-internal-asu-advi-fix-input/./synthetic_data_files/true_hmm.pkl"
+    hmm_or_params = load_hmm_or_params(true_hmm_path)
+
+    true_hmm = hmm_or_params
+
+
+
+    os.makedirs("synthetic_data_files", exist_ok=True)
+
+    sim_conf = sample_dataset_from_hmm(
+        true_hmm=true_hmm,
+        N=256,
+        T=50,
+        seed=1234,
+        confounded=True,
+    )
+
+    sim_noconf = sample_dataset_from_hmm(
+        true_hmm=true_hmm,
+        N=256,
+        T=50,
+        seed=1234,
+        confounded=False,
+        treatment_prob_unconfounded=0.5,
+    )
+
+    export_bundle("synthetic_data_files/confounded_bundle.npz", sim_conf, true_hmm)
+    export_bundle("synthetic_data_files/nonconfounded_bundle.npz", sim_noconf, true_hmm)
+
+    summarize_sim("CONF", sim_conf)
+    summarize_sim("NOCONF", sim_noconf)
